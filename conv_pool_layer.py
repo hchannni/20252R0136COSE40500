@@ -160,6 +160,7 @@ class nn_convolutional_layer:
         self.b.requires_grad = True
 
         self.input_size = input_size
+        self.cache = None
 
     def update_weights(self, dW, db):
         self.W += dW
@@ -172,20 +173,76 @@ class nn_convolutional_layer:
         self.W = W.clone().detach()
         self.b = b.clone().detach()
 
-    def forward(self, x):
+    def _parse_stride_padding(self, stride, padding):
+        if isinstance(stride, numbers.Number):
+            stride = (int(stride), int(stride))
+        if isinstance(padding, numbers.Number):
+            padding = (int(padding), int(padding))
+        if len(stride) != 2 or len(padding) != 2:
+            raise ValueError("`stride` and `padding` must be int or tuple of length 2.")
+        return stride, padding
+
+    def forward(self, x, stride=1, padding=0):
+        stride, padding = self._parse_stride_padding(stride, padding)
         N, C, H, W = x.shape
         KH, KW = self.W.shape[2], self.W.shape[3]
-        
-        windows = view_as_windows(x, (1, C, KH, KW), step=(1, 1, 1, 1))
-        
-        x_unfold = windows.reshape(windows.shape[0], windows.shape[2], windows.shape[3], -1)
-        w_flat = self.W.reshape(self.W.shape[0], -1)
-        
-        out = torch.matmul(x_unfold, w_flat.T)
-        out = out.permute(0, 3, 1, 2)
-        out = out + self.b
-        
+
+        x_padded = F.pad(x, (padding[1], padding[1], padding[0], padding[0]))
+        x_unfold = F.unfold(x_padded, kernel_size=(KH, KW), stride=stride)  # (N, C*KH*KW, L)
+        w_flat = self.W.reshape(self.W.shape[0], -1)  # (out_ch, C*KH*KW)
+
+        out = torch.bmm(w_flat.unsqueeze(0).expand(N, -1, -1), x_unfold)  # (N, out_ch, L)
+        out = out + self.b.reshape(1, self.W.shape[0], 1)
+
+        H_out = (H + 2 * padding[0] - KH) // stride[0] + 1
+        W_out = (W + 2 * padding[1] - KW) // stride[1] + 1
+        out = out.view(N, self.W.shape[0], H_out, W_out)
+
+        self.cache = {
+            "x_shape": x.shape,
+            "x_unfold": x_unfold,
+            "stride": stride,
+            "padding": padding,
+            "x_padded_shape": x_padded.shape,
+        }
+
         return out
+
+    def backward(self, d_out):
+        if self.cache is None:
+            raise RuntimeError("forward must be called before backward.")
+
+        x_shape = self.cache["x_shape"]
+        x_unfold = self.cache["x_unfold"]
+        stride = self.cache["stride"]
+        padding = self.cache["padding"]
+        x_padded_shape = self.cache["x_padded_shape"]
+
+        N, _, H_out, W_out = d_out.shape
+        out_ch = self.W.shape[0]
+        w_flat = self.W.reshape(out_ch, -1)
+
+        d_out_flat = d_out.reshape(N, out_ch, -1)  # (N, out_ch, L)
+
+        db = d_out_flat.sum(dim=(0, 2)).reshape(1, out_ch, 1, 1)
+
+        dW_batch = torch.bmm(d_out_flat, x_unfold.transpose(1, 2))  # (N, out_ch, C*KH*KW)
+        dW = dW_batch.sum(dim=0).reshape_as(self.W)
+
+        dx_unfold = torch.bmm(w_flat.t().unsqueeze(0).expand(N, -1, -1), d_out_flat)  # (N, C*KH*KW, L)
+
+        H_padded, W_padded = x_padded_shape[2], x_padded_shape[3]
+        dx_padded = F.fold(
+            dx_unfold,
+            output_size=(H_padded, W_padded),
+            kernel_size=(self.W.shape[2], self.W.shape[3]),
+            stride=stride,
+        )
+
+        pad_h, pad_w = padding
+        dx = dx_padded[:, :, pad_h : pad_h + x_shape[2], pad_w : pad_w + x_shape[3]]
+
+        return dx, dW, db
 
     
 
@@ -193,16 +250,109 @@ class nn_max_pooling_layer:
     def __init__(self, pool_size, stride):
         self.stride = stride
         self.pool_size = pool_size
+        self.cache = None
 
     def forward(self, x):
-        windows = view_as_windows(x, (1, 1, self.pool_size, self.pool_size), step=(1, 1, self.stride, self.stride))
-        
-        x_unfold = windows.reshape(windows.shape[0], windows.shape[1], windows.shape[2], windows.shape[3], -1)
-        out, _ = torch.max(x_unfold, dim=-1)
-        
+        N, C, H, W = x.shape
+        p = self.pool_size
+        s = self.stride
+
+        x_unfold = F.unfold(x, kernel_size=p, stride=s)  # (N, C*p*p, L)
+        x_unfold = x_unfold.view(N, C, p * p, -1)  # (N, C, p^2, L)
+        out, idx = torch.max(x_unfold, dim=2)  # (N, C, L)
+
+        H_out = (H - p) // s + 1
+        W_out = (W - p) // s + 1
+        out = out.view(N, C, H_out, W_out)
+
+        self.cache = {
+            "x_shape": x.shape,
+            "idx": idx,
+            "p": p,
+            "s": s,
+            "L": x_unfold.shape[-1],
+        }
+
         return out
 
+    def backward(self, d_out):
+        if self.cache is None:
+            raise RuntimeError("forward must be called before backward.")
+
+        x_shape = self.cache["x_shape"]
+        idx = self.cache["idx"]
+        p = self.cache["p"]
+        s = self.cache["s"]
+        L = self.cache["L"]
+
+        N, C, H, W = x_shape
+        d_out_flat = d_out.view(N, C, -1)  # (N, C, L)
+
+        grad_unfold = torch.zeros((N, C, p * p, L), device=d_out.device, dtype=d_out.dtype)
+        grad_unfold.scatter_(2, idx.unsqueeze(2), d_out_flat.unsqueeze(2))
+
+        grad_unfold = grad_unfold.view(N, C * p * p, L)
+        dx = F.fold(grad_unfold, output_size=(H, W), kernel_size=p, stride=s)
+
+        return dx
+
     
+def gradient_check_conv():
+    torch.manual_seed(0)
+    x = torch.randn(1, 2, 5, 5, dtype=torch.double)
+
+    layer = nn_convolutional_layer(f_height=3, f_width=3, input_size=5, in_ch_size=2, out_ch_size=3)
+    layer.W = layer.W.double()
+    layer.b = layer.b.double()
+
+    stride = (2, 1)
+    padding = (1, 1)
+
+    out_custom = layer.forward(x, stride=stride, padding=padding)
+    dout = torch.randn_like(out_custom)
+    dx_custom, dW_custom, db_custom = layer.backward(dout)
+
+    x_ref = x.clone().detach().requires_grad_(True)
+    W_ref = layer.W.clone().detach().requires_grad_(True)
+    b_ref = layer.b.clone().detach().squeeze().requires_grad_(True)
+
+    out_ref = F.conv2d(x_ref, W_ref, bias=b_ref, stride=stride, padding=padding)
+    loss = (out_ref * dout).sum()
+    loss.backward()
+
+    dx_ref = x_ref.grad
+    dW_ref = W_ref.grad
+    db_ref = b_ref.grad.reshape(1, -1, 1, 1)
+
+    def rel_err(a, b):
+        return (a - b).abs().max() / (b.abs().max().clamp_min(1e-9))
+
+    print("conv grad check:")
+    print("  dx rel error :", rel_err(dx_custom, dx_ref).item())
+    print("  dW rel error :", rel_err(dW_custom, dW_ref).item())
+    print("  db rel error :", rel_err(db_custom, db_ref).item())
+
+
+def gradient_check_pool():
+    torch.manual_seed(0)
+    x = torch.randn(1, 2, 5, 5, dtype=torch.double, requires_grad=True)
+    pool = nn_max_pooling_layer(pool_size=2, stride=2)
+
+    out_custom = pool.forward(x)
+    dout = torch.randn_like(out_custom)
+    dx_custom = pool.backward(dout)
+
+    out_ref = F.max_pool2d(x, kernel_size=2, stride=2)
+    loss = (out_ref * dout).sum()
+    loss.backward()
+
+    dx_ref = x.grad
+
+    rel_error = (dx_custom - dx_ref).abs().max() / dx_ref.abs().max().clamp_min(1e-9)
+    print("pool grad check:")
+    print("  dx rel error :", rel_error.item())
+
+
 if __name__ == "__main__":
 
     batch_size = 8
@@ -260,7 +410,9 @@ if __name__ == "__main__":
             err=torch.norm(test_out - out)/torch.norm(test_out)
             err_pool+= err
 
-    # reporting accuracy results.
     print('accuracy results')
     print('forward accuracy', 100 - err_fwd/num_test*100, '%')
     print('pooling accuracy', 100 - err_pool/num_test*100, '%')
+
+    gradient_check_conv()
+    gradient_check_pool()
